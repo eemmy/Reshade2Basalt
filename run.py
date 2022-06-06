@@ -8,6 +8,7 @@ from os.path import join as path_join
 import re
 import shutil
 import sys
+import tempfile
 
 # TODO: Improve options help
 # TODO: Remove constant "shaders" folder and put it as argument
@@ -17,48 +18,77 @@ import sys
 @click.option("--preset", "-p", default="preset.ini", show_default=True,
               help="Name of the preset .ini file to convert.")
 @click.option("--output-dir", "-o", "output", default="output/")
-@click.option("--shaders-repo", "-r", "repo", default="https://github.com/crosire/reshade-shaders.git", show_default=True)
-@click.option("--shaders-branch", "-b", "branch", default="master")
+@click.option("--shaders-repo", "-r", "repos", multiple=True,
+              default=["https://github.com/crosire/reshade-shaders.git"], show_default=True)
+@click.option("--shaders-branch-prompt", "-b", "branch",
+              default=False, help="Ask to use different branches than master")
 @click.option("--ignore-shaders", "-i", "ignored_shaders", multiple=True, type=str,
               help="Shader to ignore. Repeatable option.")
-@click.option("--delete-cached-shaders", "-d", "delete_cache", is_flag=False,
+@click.option("--use-cached-shaders", "-c", "use_cache", default=True,
               help="Clear the shaders directory first")
 @click.option("--verbose", "-v", "verbosity", count=True)  # Verbosity level unused for now, equivalent to boolean
-def run(preset, output, repo, branch, ignored_shaders, delete_cache, verbosity):
-
+def run(preset, output, repos, branch, ignored_shaders, use_cache, verbosity):
+    logging.basicConfig(level=max(10, 40-verbosity*10))
     if os.path.exists(output):
         create_dir = input("Output directory already exists. Want to overwrite it? [y/N]: ")
         if create_dir.lower().strip() != "y":
             logging.warning("Exiting the program")
             sys.exit()
     os.makedirs(output, exist_ok=True)
-    if delete_cache:
-        try:
-            shutil.rmtree("shaders")
-        except FileNotFoundError:
-            pass
-    if not (os.path.exists("shaders") and os.listdir("shaders")):
-        repo = Repo.clone_from(repo, to_path="shaders")
-        repo.git.checkout(branch)
+
+    if not (use_cache and os.path.exists(".cache")):
+        print(f"Use cache {use_cache} and .cache {os.path.exists('.cache')}")
+        shutil.rmtree(".cache", ignore_errors=True)
+        os.makedirs(".cache", exist_ok=True)
+
+        for repo in repos:
+            cur_branch = "master"
+            if branch:
+                cur_branch = input(f"Branch to use for {repo} ? [master]") or "master"
+            init_shaders(repo, cur_branch)
+
+    # Create output folder structure
+    out_shaders = path_join(output, "shaders/")
+    out_textures = path_join(output, "textures/")
+    os.makedirs(out_shaders, exist_ok=True)
+    os.makedirs(out_textures, exist_ok=True)
 
     settings = get_preset_ini(preset, ignored_shaders)
     for shader, config in settings["configurations"].items():
-        shader_path = path_join("shaders/Shaders", shader)
-        with open(shader_path, "r") as f:
-            old_shader_file = f.read()
+        shader_path = path_join(".cache/Shaders", shader)
+        try:
+            with open(shader_path, "r") as f:
+                old_shader_file = f.read()
+        except FileNotFoundError as e:
+            if "_" not in shader:
+                raise
+            logging.warning(f"{shader_path} not found, trying to find a subfolder...")
+            new_path = path_join(".cache/Shaders", shader.split("_")[0], shader)
+            with open(new_path, "r") as f:
+                old_shader_file = f.read()
         logging.info(f"Converting shader {shader_path}")
         new_shader_file = update_file(old_shader_file, config, verbosity)
         with open(path_join(output, "shaders/", shader), "w") as f:
             f.write(new_shader_file)
 
-    out_shaders = path_join(output, "shaders/")
-    out_textures = path_join(output, "textures/")
-    os.makedirs(out_shaders, exist_ok=True)
-    os.makedirs(out_textures, exist_ok=True)
-    shutil.copy("shaders/Shaders/ReShade.fxh", out_shaders)
-    shutil.copy("shaders/Shaders/ReShadeUI.fxh", out_shaders)
-    shutil.copytree("shaders/Textures", out_textures, dirs_exist_ok=True)
+    shutil.copy(".cache/Shaders/ReShade.fxh", out_shaders)
+    shutil.copy(".cache/Shaders/ReShadeUI.fxh", out_shaders)
+    shutil.copytree(".cache/Textures", out_textures, dirs_exist_ok=True)
     create_conf(settings["effects"], output)
+
+
+def init_shaders(repo, branch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = path_join(tmpdir)
+        logging.info(f"Cloning repo {repo}")
+        Repo.clone_from(repo, to_path=repo_dir, multi_options=[f"--branch={branch}"])
+        shaders_path = path_join(repo_dir, "Shaders/")
+        textures_path = path_join(repo_dir, "Textures/")
+
+        if os.path.exists(shaders_path):
+            shutil.copytree(shaders_path, ".cache/Shaders", dirs_exist_ok=True)
+        if os.path.exists(textures_path):
+            shutil.copytree(textures_path, ".cache/Textures", dirs_exist_ok=True)
 
 
 def get_preset_ini(path, ignored_shaders):
@@ -92,7 +122,7 @@ def get_preset_ini(path, ignored_shaders):
     }
 
     # Get effects names
-    for effect in map(str.strip, config["root"]["Effects"].split(",")):
+    for effect in {i.strip().split("@")[-1] for i in config["root"]["TechniqueSorting"].split(",")}:
         if not effect.endswith(".fx"):  # Is this needed (or even working as intended)?
             effect += ".fx"
 
@@ -113,6 +143,7 @@ def get_preset_ini(path, ignored_shaders):
             logging.error("Shader {} not found, add it to extra shaders or ignore this file".format(effect))
             sys.exit()
     return settings
+
 
 def create_conf(effects, output_dir):
     # Variables
@@ -142,18 +173,20 @@ def create_conf(effects, output_dir):
         f.write(file_content)
     return output_dir
 
+
 def update_file(shader: str, configs: dict, verbose=0):
     for param, value in configs.items():
         if verbose:
             logging.debug(f"Param: {param}\nValue: {value}")
 
         pattern = r"".join([
-            "(^[[:alnum:]]*[[:blank:]]*)",  # "uniform" keyword or similar, group 1
-            "([[:alnum:]]*)",  # variable type (bool, float, float2, etc), group 2
-            "([[:blank:]]*{param}[[:blank:]]*",  # name of the current parameter, group 3 until value assignment
+            "(^\[[:alnum:]]*\[[:blank:]]*)",  # "uniform" keyword or similar, group 1
+            "(\[[:alnum:]]*)",  # variable type (bool, float, float2, etc), group 2
+            "(\[[:blank:]]*{param}\[[:blank:]]*",  # name of the current parameter, group 3 until value assignment
             "<.*?>",  # content block between brackets
-            "[[:blank:]]*=[[:blank:]])(.*?);$"  # value assignment (e.g. " = 1.00;"), with value captured as group 4
-        ])  # We don't create a group for ;$ as we can replace it by hand
+            "\[[:blank:]]*=\[[:blank:]])(.*?);$"  # value assignment (e.g. " = 1.00;"), with value captured as group 4
+        ])  # Brackets have to be escaped (e.g. \[[:alnum:]]) to prevent a FutureWarning,
+        # pycharm warns about invalid sequence because their regex handler probably still follows old norms
 
         # This custom function is passed to re.sub. This could have been done through a re.search followed by re.sub,
         # but would have implied running the regex twice, which is unnecessary. Instead we hijack the substitution
