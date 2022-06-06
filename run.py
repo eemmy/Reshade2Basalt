@@ -37,7 +37,10 @@ def run(preset, output, repos, branch, ignored_shaders, use_cache, verbosity):
     os.makedirs(output, exist_ok=True)
 
     if not (use_cache and os.path.exists(".cache")):
-        print(f"Use cache {use_cache} and .cache {os.path.exists('.cache')}")
+        if os.path.exists(".cache"):
+            confirm = input("Going to delete .cache! Continue? [y/N]")
+            if confirm.lower != "y":
+                sys.exit(1)
         shutil.rmtree(".cache", ignore_errors=True)
         os.makedirs(".cache", exist_ok=True)
 
@@ -92,7 +95,8 @@ def init_shaders(repo, branch):
 
 
 def get_preset_ini(path, ignored_shaders):
-    replace_shaders_rules = {"BloomAndLensFlares.fx": "Bloom.fx"}
+    replace_shaders_rules = {"BloomAndLensFlares.fx": "Bloom.fx", "ADOF.fx": "DOF.fx",
+                             "ContrastAdaptiveSharpen.fx": "CAS.fx"}
     exclude_rules = {"Tint.fx"}
     for ignored in ignored_shaders:
         if not ignored.endswith(".fx"):
@@ -139,8 +143,9 @@ def get_preset_ini(path, ignored_shaders):
     for effect in settings['effects']:
         try:
             settings["configurations"][effect] = dict(config[effect])
-        except:  # FIXME: Remove bare except
-            logging.error("Shader {} not found, add it to extra shaders or ignore this file".format(effect))
+        except KeyError:
+            logging.error(f"Shader {effect} not found, check config file (including filename-case), "
+                          "that the shader exist, or add it to the ignored shaders")
             sys.exit()
     return settings
 
